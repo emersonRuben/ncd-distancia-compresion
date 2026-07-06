@@ -1,0 +1,18 @@
+# LaTeX and Docs
+latex/
+docs/
+
+# Data
+datos/dataset_desercion.csv
+
+# Execution Results
+resultados/
+datos/particiones/
+
+# Python caches and environments
+__pycache__/
+*.pyc
+venv/
+.env
+.pytest_cache/
+.mypy_cache/
