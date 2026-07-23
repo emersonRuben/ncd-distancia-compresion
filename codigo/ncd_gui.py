@@ -18,6 +18,7 @@ Uso:
 
 import os
 import sys
+import pickle
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -29,10 +30,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 import matplotlib.pyplot as plt
 import networkx as nx
 
-# Módulos del proyecto
-from ncd_datos import generar_dataset, RUTA_SALIDA
-from ncd_calculo import calcular_matriz_ncd, normalizar_matriz, obtener_etiquetas, discretizar_dataframe
-from ncd_particiones import particionar_dataset, imprimir_resumen, guardar_todas_las_particiones
+from ncd_calculo import calcular_matriz_ncd, obtener_etiquetas
+from ncd_particiones import (particionar_dataset, imprimir_resumen, guardar_todas_las_particiones,
+                              nombre_mejor, nombre_peor, nombres_grupos_finos)
 from ncd_algoritmos import construir_grafo_completo, kruskal, prim, comparar_mst
 from ncd_graficos import (
     PALETA,
@@ -41,14 +41,27 @@ from ncd_graficos import (
     dibujar_mst,
     dibujar_barras_grado,
     crear_dashboard,
+    dibujar_dag_bayesiano,
     VARIABLES_CRITICAS
 )
+from ncd_bayesian import construir_dag_bayesiano, calcular_cpds, inferir_probabilidad
 
-# Rutas estándar
+
+# ── Configuración del particionamiento (sincronizada con ncd_pipeline.py) ───────────
+# Cambia este valor para ajustar la granularidad del análisis.
+# Valores válidos: 50.0, 25.0, 12.5, 6.25, ...
+PORCENTAJE_PARTICION = 6.25
+
+NOMBRE_MEJOR = nombre_mejor(PORCENTAJE_PARTICION)         # ej: "B16C1"
+NOMBRE_PEOR  = nombre_peor(PORCENTAJE_PARTICION)          # ej: "W16C8"
+GRUPOS_FINOS = nombres_grupos_finos(PORCENTAJE_PARTICION)  # ej: ["B16C1", ..., "W16C8"]
+
+
+# ── Rutas estándar ──────────────────────────────────────────────────────────
 RUTA_DATOS = "../datos/dataset_desercion.csv"
 RUTA_PARTICIONES = "../datos/particiones"
-RUTA_PARTICIONES_DISCRETIZADAS = "../datos/particiones_discretizadas"
 RUTA_RESULTADOS = "../resultados"
+RUTA_CACHE = "../resultados/ncd_cache.pkl"
 
 
 class RedireccionadorSalida:
@@ -86,13 +99,13 @@ class NCDApp:
         # Variables de estado
         self.df = None
         self.particiones = None
-        self.grupo_seleccionado = tk.StringVar(value="B8C1")
+        self.grupo_seleccionado = tk.StringVar(value=NOMBRE_MEJOR)
         self.paso_actual = 1
         
         # Resultados calculados por grupo
         self.resultados = {
-            "B8C1": {},
-            "W8C4": {}
+            NOMBRE_MEJOR: {},
+            NOMBRE_PEOR: {}
         }
 
         # Guardar stdout original
@@ -145,7 +158,7 @@ class NCDApp:
         """Carga el dataset si existe, o avisa para generarlo."""
         print("=== Inicializando la Aplicación NCD ===")
         if not os.path.exists(RUTA_DATOS):
-            print("  [INFO] Dataset no encontrado. Se generará automáticamente al cargar...")
+            print("  [ADVERTENCIA] Dataset final no encontrado en la ruta esperada.")
             
         # Iniciar por defecto en Paso 1
         self.ir_a_paso(1)
@@ -186,19 +199,19 @@ class NCDApp:
         radio_frame = tk.Frame(self.sidebar_frame, bg=PALETA["superficie"])
         radio_frame.pack(fill="x", padx=15, pady=5)
 
-        # Botón radio para B8C1
+        # Botón radio para Mejores
         self.rb_mejores = tk.Radiobutton(
-            radio_frame, text="B8C1 (Mejores 12.5%)", variable=self.grupo_seleccionado, 
-            value="B8C1", command=self.al_cambiar_grupo, bg=PALETA["superficie"], 
+            radio_frame, text=f"{NOMBRE_MEJOR} (Mejores {PORCENTAJE_PARTICION}%)", variable=self.grupo_seleccionado, 
+            value=NOMBRE_MEJOR, command=self.al_cambiar_grupo, bg=PALETA["superficie"], 
             fg=PALETA["etiqueta"], selectcolor=PALETA["fondo"], activebackground=PALETA["superficie"],
             activeforeground=PALETA["acento"], font=("Segoe UI", 9, "bold")
         )
         self.rb_mejores.pack(anchor="w", pady=2)
 
-        # Botón radio para W8C4
+        # Botón radio para Peores
         self.rb_peores = tk.Radiobutton(
-            radio_frame, text="W8C4 (Peores 12.5%)", variable=self.grupo_seleccionado, 
-            value="W8C4", command=self.al_cambiar_grupo, bg=PALETA["superficie"], 
+            radio_frame, text=f"{NOMBRE_PEOR} (Peores {PORCENTAJE_PARTICION}%)", variable=self.grupo_seleccionado, 
+            value=NOMBRE_PEOR, command=self.al_cambiar_grupo, bg=PALETA["superficie"], 
             fg=PALETA["etiqueta"], selectcolor=PALETA["fondo"], activebackground=PALETA["superficie"],
             activeforeground=PALETA["acento"], font=("Segoe UI", 9, "bold")
         )
@@ -226,10 +239,11 @@ class NCDApp:
             "6. MST Kruskal (Árbol)",
             "7. MST Prim (Árbol)",
             "8. Comparación de MSTs",
-            "9. Hubs & Variables Críticas",
-            "10. Validación Matemática",
-            "11. Dashboard Completo"
+            "9. Variables Críticas (NCD)",
+            "10. Dashboard Completo",
+            "11. Red Bayesiana (DAG & CPD)"
         ]
+
         self.botones_pasos = []
         for idx, texto in enumerate(self.pasos_labels, 1):
             btn = tk.Button(
@@ -289,23 +303,40 @@ class NCDApp:
         self.ir_a_paso(self.paso_actual)
 
     def ejecutar_calculos_grupo(self):
-        """Calcula todos los pasos para el grupo seleccionado para permitir navegación instantánea."""
+        """Calcula todos los pasos para el grupo seleccionado para permitir navegación instantánea, o los lee del caché."""
         grupo = self.grupo_seleccionado.get()
         print(f"\n============================================================")
-        print(f"  CALCULANDO PASOS COMPLETOS PARA EL GRUPO: {grupo}")
+        print(f"  PREPARANDO DATOS PARA EL GRUPO: {grupo}")
         print(f"============================================================")
         
+        if os.path.exists(RUTA_CACHE):
+            print(f"  [CACHE] Encontrado archivo de caché en {RUTA_CACHE}.")
+            print("  [CACHE] Cargando datos precomputados para una navegación instantánea...")
+            try:
+                with open(RUTA_CACHE, "rb") as f:
+                    cache_data = pickle.load(f)
+                self.df = cache_data["df"]
+                self.particiones = cache_data["particiones"]
+                if cache_data.get("resultados") and grupo in cache_data["resultados"]:
+                    self.resultados.update(cache_data["resultados"])
+                    print(f"  [OK] Caché cargada exitosamente para {grupo}.")
+                    return
+            except Exception as e:
+                print(f"  [ERROR] No se pudo leer el caché: {e}")
+                print("  Recalculando desde cero...")
+
+        print("  [INFO] Ejecutando cálculos pesados... Esto tomará un momento.")
         # Paso 1: Cargar datos
         if self.df is None:
             if not os.path.exists(RUTA_DATOS):
-                print("  Generando dataset de 18,000 registros...")
-                generar_dataset()
+                messagebox.showerror("Error", f"Dataset no encontrado en {RUTA_DATOS}")
+                return
             self.df = pd.read_csv(RUTA_DATOS)
             print(f"  [OK] Dataset original cargado con {len(self.df):,} filas.")
         
         # Paso 2: Particionar
         if self.particiones is None:
-            self.particiones = particionar_dataset(self.df)
+            self.particiones = particionar_dataset(self.df, PORCENTAJE_PARTICION)
             print("  [OK] Particionamiento jerárquico realizado.")
         
         df_grupo = self.particiones[grupo]
@@ -313,12 +344,11 @@ class NCDApp:
         # Paso 3: Calcular NCD
         print(f"\n  [Paso 3] Calculando matriz NCD para {grupo}...")
         matriz, columnas = calcular_matriz_ncd(df_grupo)
-        matriz_norm = normalizar_matriz(matriz)
         etiquetas = obtener_etiquetas(columnas)
         
         # Paso 4: Grafo K11
-        print(f"\n  [Paso 4] Construyendo grafo completo K11...")
-        grafo = construir_grafo_completo(matriz_norm, etiquetas)
+        print(f"\n  [Paso 4] Construyendo grafo completo...")
+        grafo = construir_grafo_completo(matriz, etiquetas)
         
         # Paso 5: Kruskal
         print(f"\n  [Paso 5] Ejecutando algoritmo de Kruskal...")
@@ -332,7 +362,6 @@ class NCDApp:
         self.resultados[grupo] = {
             "df_grupo": df_grupo,
             "matriz": matriz,
-            "matriz_norm": matriz_norm,
             "etiquetas": etiquetas,
             "grafo": grafo,
             "mst_kruskal": mst_kruskal,
@@ -343,20 +372,18 @@ class NCDApp:
         
         print(f"\n  [OK] Calculos completados y cacheados para el grupo {grupo}.")
         print(f"============================================================\n")
-        
-        # Recargar paso actual para reflejar los resultados
-        self.ir_a_paso(self.paso_actual)
 
     def obtener_datos_grupo_actual(self):
         """Obtiene o calcula los datos del grupo seleccionado actual de forma perezosa."""
         grupo = self.grupo_seleccionado.get()
-        if not self.resultados[grupo]:
+        if not self.resultados.get(grupo) or "mst_prim" not in self.resultados[grupo]:
             # Ejecutar cálculos si no están cacheados
             self.ejecutar_calculos_grupo()
         return self.resultados[grupo]
 
     def limpiar_display(self):
-        """Elimina todos los widgets dentro del panel central de visualización."""
+        """Elimina todos los widgets y cierra figuras de Matplotlib para liberar memoria."""
+        plt.close("all")
         for widget in self.display_frame.winfo_children():
             widget.destroy()
 
@@ -390,8 +417,7 @@ class NCDApp:
             if numero_paso > 1 and self.df is None:
                 print("\n[GUI] Cargando dataset para proceder...")
                 if not os.path.exists(RUTA_DATOS):
-                    print("  Generando dataset...")
-                    generar_dataset()
+                    raise FileNotFoundError(f"Dataset no encontrado en {RUTA_DATOS}")
                 self.df = pd.read_csv(RUTA_DATOS)
 
             if numero_paso == 1:
@@ -416,6 +442,7 @@ class NCDApp:
                 self.render_paso_10()
             elif numero_paso == 11:
                 self.render_paso_11()
+
         except Exception as e:
             # Capturar errores y mostrarlos en el display
             import traceback
@@ -445,7 +472,7 @@ class NCDApp:
             
             lbl_info = tk.Label(
                 info_frame, 
-                text="El dataset sintético de deserción contiene 18,000 registros y 11 variables (X1 a X11).\nDebe ser cargado en memoria para poder particionarlo y calcular la similitud NCD.",
+                text=f"El dataset final de deserción contiene los registros de estudiantes y {len(self.df.columns) if self.df is not None else 11} variables (X1 a X11).\nDebe ser cargado en memoria para poder particionarlo y calcular la similitud NCD.",
                 font=("Segoe UI", 11), fg=PALETA["etiqueta"], bg=PALETA["superficie"], justify="left"
             )
             lbl_info.pack(padx=15, pady=15, anchor="w")
@@ -501,8 +528,8 @@ class NCDApp:
         print("  PASO 1 – Cargar dataset")
         print("============================================================")
         if not os.path.exists(RUTA_DATOS):
-            print("  Dataset no encontrado. Generando nuevo dataset de 18,000 registros...")
-            generar_dataset()
+            messagebox.showerror("Error", f"Dataset no encontrado en {RUTA_DATOS}")
+            return
         self.df = pd.read_csv(RUTA_DATOS)
         print(f"  [OK] Dataset cargado: {len(self.df):,} registros, {len(self.df.columns)} variables")
         print(f"  Variables: {list(self.df.columns)}")
@@ -515,7 +542,7 @@ class NCDApp:
         lbl.pack(anchor="w", pady=(0, 10))
 
         if self.particiones is None:
-            self.particiones = particionar_dataset(self.df)
+            self.particiones = particionar_dataset(self.df, PORCENTAJE_PARTICION)
             # Guardar particiones en disco en background para cumplir con la estructura
             guardar_todas_las_particiones(self.particiones, RUTA_PARTICIONES)
             
@@ -536,25 +563,25 @@ class NCDApp:
                                  font=("Segoe UI", 11, "bold"), fg=PALETA["acento"], bg=PALETA["superficie"])
         lbl_arb_title.pack(anchor="w", padx=15, pady=(15, 10))
 
+        total = len(self.df)
+        mitad = total // 2
+        cuarto = mitad // 2
+        len_mejor = len(self.particiones[NOMBRE_MEJOR]) if self.particiones and NOMBRE_MEJOR in self.particiones else 0
+        len_peor  = len(self.particiones[NOMBRE_PEOR])  if self.particiones and NOMBRE_PEOR in self.particiones else 0
+        
         arbol_texto = (
-            "Dataset Completo (18,000 registros)\n"
-            " ├── B2C1 (Mejor 50% - 9,000)\n"
-            " │    ├── B4C1 (Mejor 25% - 4,500)\n"
-            " │    │    ├── B8C1 (Mejor 12.5% - 2,250) <-- MEJORES\n"
-            " │    │    └── B8C2 (2,250)\n"
-            " │    └── B4C2 (4,500)\n"
-            " │         ├── B8C3 (2,250)\n"
-            " │         └── B8C4 (2,250)\n"
-            " └── W2C1 (Peor 50% - 9,000)\n"
-            "      ├── W4C1 (Peor 25% - 4,500)\n"
-            "      │    ├── W8C1 (2,250)\n"
-            "      │    └── W8C2 (2,250)\n"
-            "      └── W4C2 (4,500)\n"
-            "           ├── W8C3 (2,250)\n"
-            "           └── W8C4 (Peor 12.5% - 2,250) <-- PEORES\n"
+            f"Dataset Completo ({total:,} registros)\n"
+            f" ├── B2C1 (Mejor 50% - {mitad:,})\n"
+            f" │    ├── B4C1 (Mejor 25% - {cuarto:,})\n"
+            f" │    │    └── ... → {NOMBRE_MEJOR} (Mejores {PORCENTAJE_PARTICION}% - {len_mejor:,}) <-- MEJORES\n"
+            f" └── W2C1 (Peor 50% - {total - mitad:,})\n"
+            f"      └── W4C2 (Peor 25% - {cuarto:,})\n"
+            f"           └── ... → {NOMBRE_PEOR} (Peores {PORCENTAJE_PARTICION}% - {len_peor:,}) <-- PEORES\n"
+            f"\nTotal de particiones finas ({PORCENTAJE_PARTICION}%): {len(GRUPOS_FINOS)} grupos\n"
+            f"Grupos: {', '.join(GRUPOS_FINOS[:4])} ... {', '.join(GRUPOS_FINOS[-4:])}"
         )
         
-        lbl_arbol = tk.Label(arbol_frame, text=arbol_texto, font=("Consolas", 10), 
+        lbl_arbol = tk.Label(arbol_frame, text=arbol_texto, font=("Consolas", 9), 
                              fg=PALETA["etiqueta"], bg=PALETA["superficie"], justify="left")
         lbl_arbol.pack(padx=15, pady=5, anchor="w")
 
@@ -562,13 +589,13 @@ class NCDApp:
         tabla_frame = tk.Frame(cuerpo_frame, bg=PALETA["superficie"], bd=1, relief="solid")
         tabla_frame.pack(side="left", fill="both", expand=True)
 
-        lbl_tab_title = tk.Label(tabla_frame, text="Detalle de Estadísticas de Octavos", 
+        lbl_tab_title = tk.Label(tabla_frame, text=f"Detalle de Estadísticas de Particiones Finas ({len(GRUPOS_FINOS)} grupos)", 
                                  font=("Segoe UI", 11, "bold"), fg=PALETA["acento"], bg=PALETA["superficie"])
         lbl_tab_title.pack(anchor="w", padx=15, pady=(15, 10))
 
         tree = ttk.Treeview(tabla_frame, columns=("Grupo", "Registros", "NotaMin", "NotaMax"), 
-                            show="headings", height=8)
-        tree.heading("Grupo", text="Grupo (Octavo)")
+                            show="headings", height=10)
+        tree.heading("Grupo", text=f"Grupo ({PORCENTAJE_PARTICION}%)")
         tree.heading("Registros", text="N° Registros")
         tree.heading("NotaMin", text="Nota Mínima")
         tree.heading("NotaMax", text="Nota Máxima")
@@ -578,13 +605,13 @@ class NCDApp:
         tree.column("NotaMin", width=100, anchor="center")
         tree.column("NotaMax", width=100, anchor="center")
 
-        grupos = ["B8C1", "B8C2", "B8C3", "B8C4", "W8C1", "W8C2", "W8C3", "W8C4"]
-        for g in grupos:
-            df_g = self.particiones[g]
-            n_reg = len(df_g)
-            nota_min = df_g["X11_Nota_Promedio"].min()
-            nota_max = df_g["X11_Nota_Promedio"].max()
-            tree.insert("", "end", values=(g, f"{n_reg:,}", f"{nota_min:.2f}", f"{nota_max:.2f}"))
+        for g in GRUPOS_FINOS:
+            if g in self.particiones:
+                df_g = self.particiones[g]
+                n_reg = len(df_g)
+                nota_min = df_g["X11_Nota_Promedio"].min()
+                nota_max = df_g["X11_Nota_Promedio"].max()
+                tree.insert("", "end", values=(g, f"{n_reg:,}", f"{nota_min:.2f}", f"{nota_max:.2f}"))
 
         tree.pack(fill="both", expand=True, padx=15, pady=(0, 15))
 
@@ -603,7 +630,7 @@ class NCDApp:
         datos = self.obtener_datos_grupo_actual()
         
         # Dibujar heatmap y capturar la figura
-        fig = dibujar_heatmap(datos["matriz_norm"], datos["etiquetas"], mostrar=False)
+        fig = dibujar_heatmap(datos["matriz"], datos["etiquetas"], mostrar=False)
         self.mostrar_figura(fig)
 
     def render_paso_4(self):
@@ -624,96 +651,141 @@ class NCDApp:
         self.mostrar_figura(fig)
 
     def render_paso_5(self):
-        """Paso 5: MST por Partición (Octavos)."""
-        lbl = tk.Label(self.display_frame, text="PASO 5: Árbol de Expansión Mínima (MST) por Partición (B8C1 a W8C4)", 
+        """Paso 5: MST por Partición — vista individual y grid de las particiones finas."""
+        lbl = tk.Label(self.display_frame, text=f"PASO 5: Árbol de Expansión Mínima (MST) — Las {len(GRUPOS_FINOS)} Particiones ({PORCENTAJE_PARTICION}%)",
                        font=("Segoe UI", 14, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
         lbl.pack(anchor="w", pady=(0, 5))
 
-        # Contenedor de controles de selección de partición
-        selector_frame = tk.Frame(self.display_frame, bg=PALETA["superficie"], bd=1, relief="solid")
+        if self.particiones is None:
+            tk.Label(self.display_frame,
+                     text="Primero ejecuta 'Calcular Todo para Grupo' para cargar las particiones.",
+                     font=("Segoe UI", 11), fg=PALETA["nodo_hub"], bg=PALETA["fondo"]).pack(pady=40)
+            return
+
+        # Notebook: Grid de particiones | Individual
+        notebook = ttk.Notebook(self.display_frame)
+        notebook.pack(fill="both", expand=True)
+        self.estilo.configure("TNotebook", background=PALETA["fondo"])
+        self.estilo.configure("TNotebook.Tab", background=PALETA["superficie"],
+                              foreground=PALETA["etiqueta"], font=("Segoe UI", 10, "bold"), padding=[10, 4])
+        self.estilo.map("TNotebook.Tab",
+                        background=[("selected", PALETA["borde"])],
+                        foreground=[("selected", PALETA["acento"])])
+
+        # ── Pestaña 1: Grid con todos los MSTs ─────────────────────────────
+        tab_grid = ttk.Frame(notebook)
+        notebook.add(tab_grid, text=f"Vista General ({len(GRUPOS_FINOS)} Particiones)")
+
+        num_grupos = len(GRUPOS_FINOS)
+        n_cols = 4
+        n_rows = (num_grupos + n_cols - 1) // n_cols
+
+        fig_grid = plt.Figure(figsize=(14, max(7, 2.3 * n_rows)), facecolor=PALETA["fondo"])
+        fig_grid.subplots_adjust(hspace=0.45, wspace=0.25, top=0.93, bottom=0.04, left=0.03, right=0.97)
+
+        for pos, group_name in enumerate(GRUPOS_FINOS):
+            ax = fig_grid.add_subplot(n_rows, n_cols, pos + 1)
+            datos_oct = self._obtener_mst_particion(group_name)
+            mst = datos_oct["mst_kruskal"]
+            hubs = [n for n, g in mst.degree() if g >= 3]
+            es_peor = group_name.startswith("W")
+            dibujar_mst(mst, hubs, ax, es_peor=es_peor)
+            peso = sum(d["weight"] for _, _, d in mst.edges(data=True))
+            ax.set_title(f"{group_name}  (w={peso:.3f})",
+                         color=PALETA["nodo_hub"] if es_peor else PALETA["acento"],
+                         fontsize=9, fontweight="bold", pad=4)
+
+        fig_grid.suptitle(f"MST por Partición — {NOMBRE_MEJOR} → {NOMBRE_PEOR}",
+                          color=PALETA["titulo"], fontsize=12, fontweight="bold")
+
+        canvas_grid = FigureCanvasTkAgg(fig_grid, master=tab_grid)
+        canvas_grid.draw()
+        canvas_grid.get_tk_widget().pack(fill="both", expand=True)
+        toolbar_frame = tk.Frame(tab_grid, bg=PALETA["superficie"])
+        toolbar_frame.pack(fill="x")
+        tb = NavigationToolbar2Tk(canvas_grid, toolbar_frame)
+        tb.update()
+        tb.config(background=PALETA["superficie"])
+
+        # ── Pestaña 2: Individual (radio buttons) ──────────────────────────────
+        tab_ind = ttk.Frame(notebook)
+        notebook.add(tab_ind, text="Vista Individual")
+
+        selector_frame = tk.Frame(tab_ind, bg=PALETA["superficie"], bd=1, relief="solid")
         selector_frame.pack(fill="x", pady=5)
 
-        lbl_sel = tk.Label(selector_frame, text="Seleccionar Partición (Octavo):", 
+        lbl_sel = tk.Label(selector_frame, text="Seleccionar Partición:",
                            font=("Segoe UI", 10, "bold"), fg=PALETA["etiqueta"], bg=PALETA["superficie"])
         lbl_sel.pack(side="left", padx=10, pady=10)
 
-        # Crear variable para la partición seleccionada si no existe
         if not hasattr(self, "particion_mst_seleccionada"):
-            self.particion_mst_seleccionada = tk.StringVar(value="B8C1")
+            self.particion_mst_seleccionada = tk.StringVar(value=NOMBRE_MEJOR)
 
-        # Radio buttons para cada uno de los 8 octavos
-        octavos = ["B8C1", "B8C2", "B8C3", "B8C4", "W8C1", "W8C2", "W8C3", "W8C4"]
-        for oct_name in octavos:
-            rb = tk.Radiobutton(
-                selector_frame, text=oct_name, variable=self.particion_mst_seleccionada,
-                value=oct_name, command=self.actualizar_mst_particion,
-                bg=PALETA["superficie"], fg=PALETA["etiqueta"], selectcolor=PALETA["fondo"],
-                activebackground=PALETA["superficie"], font=("Segoe UI", 9, "bold")
-            )
-            rb.pack(side="left", padx=5)
-
-        # Contenedor para el gráfico y la descripción
-        self.mst_particion_canvas_frame = tk.Frame(self.display_frame, bg=PALETA["fondo"])
+        # Contenedor para el canvas individual
+        self.mst_particion_canvas_frame = tk.Frame(tab_ind, bg=PALETA["fondo"])
         self.mst_particion_canvas_frame.pack(fill="both", expand=True, pady=5)
+
+        for group_name in GRUPOS_FINOS:
+            rb = tk.Radiobutton(
+                selector_frame, text=group_name, variable=self.particion_mst_seleccionada,
+                value=group_name, command=self.actualizar_mst_particion,
+                bg=PALETA["superficie"], fg=PALETA["etiqueta"], selectcolor=PALETA["fondo"],
+                activebackground=PALETA["superficie"], font=("Segoe UI", 8, "bold")
+            )
+            rb.pack(side="left", padx=2)
 
         self.actualizar_mst_particion()
 
+    def _obtener_mst_particion(self, oct_name):
+        """Obtiene (o calcula) los datos MST completos para una partición dada."""
+        if oct_name not in self.resultados or not self.resultados[oct_name] or "mst_prim" not in self.resultados[oct_name]:
+            print(f"  [GUI] Calculando MST para partición {oct_name}...")
+            df_g = self.particiones[oct_name]
+            matriz, columnas = calcular_matriz_ncd(df_g)
+            etiquetas = obtener_etiquetas(columnas)
+            grafo = construir_grafo_completo(matriz, etiquetas)
+            mst_k, aristas_k = kruskal(grafo)
+            mst_p, aristas_p = prim(grafo, nodo_inicio=etiquetas[0])
+            self.resultados[oct_name] = {
+                "df_grupo": df_g,
+                "matriz": matriz,
+                "etiquetas": etiquetas,
+                "grafo": grafo,
+                "mst_kruskal": mst_k,
+                "aristas_kruskal": aristas_k,
+                "mst_prim": mst_p,
+                "aristas_prim": aristas_p
+            }
+        return self.resultados[oct_name]
+
     def actualizar_mst_particion(self):
-        # Limpiar el contenedor del canvas de gráfico
+        """Actualiza el canvas de vista individual con la partición seleccionada."""
         for widget in self.mst_particion_canvas_frame.winfo_children():
             widget.destroy()
 
         oct_sel = self.particion_mst_seleccionada.get()
+        datos = self._obtener_mst_particion(oct_sel)
 
-        # Calcular si no está en resultados
-        if oct_sel not in self.resultados or not self.resultados[oct_sel]:
-            print(f"  [GUI] Calculando datos para partición {oct_sel}...")
-            # Obtener el dataframe de la partición
-            df_g = self.particiones[oct_sel]
-            # Calcular
-            df_disc = discretizar_dataframe(df_g)
-            matriz, etiquetas = calcular_matriz_ncd(df_disc)
-            mat_norm = normalizar_matriz(matriz)
-            grafo = construir_grafo_completo(mat_norm, etiquetas)
-            mst, _ = kruskal(grafo)
-            self.resultados[oct_sel] = {
-                "matriz_norm": mat_norm,
-                "etiquetas": etiquetas,
-                "grafo": grafo,
-                "mst_kruskal": mst
-            }
-
-        datos = self.resultados[oct_sel]
-        
-        # Graficar
-        fig = plt.Figure(figsize=(8, 5.2), facecolor=PALETA["fondo"])
-        ax = fig.add_subplot(111)
-        
-        hubs = [n for n, grado in datos["mst_kruskal"].degree() if grado >= 3]
+        mst = datos["mst_kruskal"]
+        hubs = [n for n, grado in mst.degree() if grado >= 3]
         es_peor = oct_sel.startswith("W")
-        
-        dibujar_mst(datos["mst_kruskal"], hubs, ax, es_peor=es_peor)
-        
-        # Título interno
-        fig.suptitle(f"MST - Partición {oct_sel} (Peso total: {sum(d['weight'] for u, v, d in datos['mst_kruskal'].edges(data=True)):.4f})", 
+        peso_total = sum(d["weight"] for _, _, d in mst.edges(data=True))
+
+        fig = plt.Figure(figsize=(9, 5.5), facecolor=PALETA["fondo"])
+        ax = fig.add_subplot(111)
+        dibujar_mst(mst, hubs, ax, es_peor=es_peor)
+        fig.suptitle(f"MST — Partición {oct_sel}  |  Peso total: {peso_total:.4f}",
                      color=PALETA["titulo"], fontsize=11, fontweight="bold")
-        
-        # Mostrar figura
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
         canvas = FigureCanvasTkAgg(fig, master=self.mst_particion_canvas_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill="both", expand=True)
 
-        # Mostrar info de hubs
-        lbl_hubs_text = f"Hubs identificados en {oct_sel} (grado >= 3): "
-        if hubs:
-            lbl_hubs_text += ", ".join(hubs)
-        else:
-            lbl_hubs_text += "Ninguno (estructura lineal)"
-            
-        lbl_hubs = tk.Label(self.mst_particion_canvas_frame, text=lbl_hubs_text, 
-                             font=("Segoe UI", 10, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
-        lbl_hubs.pack(pady=5)
+        hubs_txt = ", ".join(hubs) if hubs else "Ninguno (estructura lineal)"
+        tk.Label(self.mst_particion_canvas_frame,
+                 text=f"Hubs (grado ≥ 3) en {oct_sel}: {hubs_txt}",
+                 font=("Segoe UI", 10, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"]).pack(pady=5)
+
 
     def render_paso_6(self):
         """Paso 6: MST Kruskal."""
@@ -727,7 +799,7 @@ class NCDApp:
         ax = fig.add_subplot(111)
         
         hubs = [n for n, grado in datos["mst_kruskal"].degree() if grado >= 3]
-        es_peor = (self.grupo_seleccionado.get() == "W8C4")
+        es_peor = (self.grupo_seleccionado.get() == NOMBRE_PEOR)
         dibujar_mst(datos["mst_kruskal"], hubs, ax, es_peor=es_peor)
         
         self.mostrar_figura(fig)
@@ -744,7 +816,7 @@ class NCDApp:
         ax = fig.add_subplot(111)
         
         hubs = [n for n, grado in datos["mst_prim"].degree() if grado >= 3]
-        es_peor = (self.grupo_seleccionado.get() == "W8C4")
+        es_peor = (self.grupo_seleccionado.get() == NOMBRE_PEOR)
         dibujar_mst(datos["mst_prim"], hubs, ax, es_peor=es_peor)
         
         self.mostrar_figura(fig)
@@ -811,217 +883,266 @@ class NCDApp:
         lbl_res.pack(anchor="w")
 
     def render_paso_9(self):
-        lbl = tk.Label(self.display_frame, text="PASO 9: Identificación de Variables Críticas (B8C1 vs W8C4)", 
+        """Paso 9: Variables Críticas por cambio de patrón de relaciones NCD (fila completa)."""
+        lbl = tk.Label(self.display_frame, text=f"PASO 9: Variables Críticas — Cambio de Patrón de Relaciones NCD ({NOMBRE_MEJOR} vs {NOMBRE_PEOR})",
                        font=("Segoe UI", 14, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
-        lbl.pack(anchor="w", pady=(0, 10))
+        lbl.pack(anchor="w", pady=(0, 5))
 
-        if not self.resultados["W8C4"]:
-            self.grupo_seleccionado.set("W8C4")
+        # Asegurar que ambos grupos estén calculados
+        if not self.resultados.get(NOMBRE_MEJOR) or not self.resultados.get(NOMBRE_PEOR):
+            self.grupo_seleccionado.set(NOMBRE_PEOR)
             self.ejecutar_calculos_grupo()
-            self.grupo_seleccionado.set("B8C1")  # restaurar
+            self.grupo_seleccionado.set(NOMBRE_MEJOR)
+            self.ejecutar_calculos_grupo()
 
-        datos_b8 = self.resultados["B8C1"]
-        datos_w8 = self.resultados["W8C4"]
+        datos_b8 = self.resultados[NOMBRE_MEJOR]
+        datos_w8 = self.resultados[NOMBRE_PEOR]
+        etiquetas = datos_b8["etiquetas"]
+        n_vars = len(etiquetas)
+        mat_b8 = datos_b8["matriz"]
+        mat_w8 = datos_w8["matriz"]
 
-        # Crear figura con 2 subplots lado a lado (tamaño expandido al quitar el texto inferior)
-        fig = plt.Figure(figsize=(12, 7.5), facecolor=PALETA["fondo"])
+        # Calcular sumas de fila completa (j != i) para ambos grupos
+        sumas_b8 = [sum(mat_b8[i, j] for j in range(n_vars) if j != i) for i in range(n_vars)]
+        sumas_w8 = [sum(mat_w8[i, j] for j in range(n_vars) if j != i) for i in range(n_vars)]
+        deltas_abs  = [abs(sumas_b8[i] - sumas_w8[i]) for i in range(n_vars)]
+        deltas_sign = [sumas_b8[i] - sumas_w8[i]      for i in range(n_vars)]
+
+        # Umbral: media + 0.5*std
+        umbral = float(np.mean(deltas_abs) + 0.5 * np.std(deltas_abs))
+        variables_criticas = [etiquetas[i] for i in range(n_vars) if deltas_abs[i] >= umbral]
+
+        # ── Descripción del método ──────────────────────────────────────────────
+        desc_frame = tk.Frame(self.display_frame, bg=PALETA["superficie"], bd=1, relief="solid")
+        desc_frame.pack(fill="x", padx=5, pady=(0, 8))
+        desc_text = (
+            "Definición: una variable crítica es aquella cuyo patrón de relación con las demás variables\n"
+            f"presenta uno de los mayores cambios al comparar {NOMBRE_MEJOR} (mejores) vs {NOMBRE_PEOR} (peores).\n"
+            "Métrica: Suma de distancias NCD de cada variable a todas las demás (fila completa, sin diagonal).\n"
+            f"Umbral de criticidad: media + 0.5·σ = {umbral:.4f}    |   "
+            f"Variables críticas identificadas ({len(variables_criticas)}): {', '.join(variables_criticas) if variables_criticas else 'Ninguna'}"
+        )
+        lbl_desc = tk.Label(desc_frame, text=desc_text, font=("Segoe UI", 9), fg=PALETA["etiqueta"],
+                            bg=PALETA["superficie"], justify="left")
+        lbl_desc.pack(anchor="w", padx=12, pady=8)
+
+        # ── Notebook con tabla + gráficos ───────────────────────────────────────
+        notebook = ttk.Notebook(self.display_frame)
+        notebook.pack(fill="both", expand=True)
+        self.estilo.configure("TNotebook", background=PALETA["fondo"])
+        self.estilo.configure("TNotebook.Tab", background=PALETA["superficie"],
+                              foreground=PALETA["etiqueta"], font=("Segoe UI", 10, "bold"), padding=[10, 4])
+        self.estilo.map("TNotebook.Tab",
+                        background=[("selected", PALETA["borde"])],
+                        foreground=[("selected", PALETA["acento"])])
+
+        # Pestaña 1: Tabla de análisis
+        tab_tabla = ttk.Frame(notebook)
+        notebook.add(tab_tabla, text="Análisis por Variable")
+
+        tabla_frame = tk.Frame(tab_tabla, bg=PALETA["superficie"])
+        tabla_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        cols = ("#", "Variable", f"Suma {NOMBRE_MEJOR}", f"Suma {NOMBRE_PEOR}", "|Delta|", f"{NOMBRE_MEJOR}-{NOMBRE_PEOR}", "Dirección")
+        tree = ttk.Treeview(tabla_frame, columns=cols, show="headings", height=n_vars)
+        for col in cols:
+            tree.heading(col, text=col)
+        tree.column("#",                            width=35,  anchor="center")
+        tree.column("Variable",                     width=165, anchor="w")
+        tree.column(f"Suma {NOMBRE_MEJOR}",         width=95,  anchor="center")
+        tree.column(f"Suma {NOMBRE_PEOR}",          width=95,  anchor="center")
+        tree.column("|Delta|",                      width=85,  anchor="center")
+        tree.column(f"{NOMBRE_MEJOR}-{NOMBRE_PEOR}",width=95,  anchor="center")
+        tree.column("Dirección",                    width=170, anchor="w")
+
+        # Definir tag visual para filas críticas
+        tree.tag_configure("critica", foreground=PALETA["variable_critica"], font=("Segoe UI", 9, "bold"))
+
+        for i in range(n_vars):
+            es_critica = deltas_abs[i] >= umbral
+            d = deltas_sign[i]
+            direccion = (f"más distante en {NOMBRE_MEJOR}" if d > 0 else
+                         f"más distante en {NOMBRE_PEOR}" if d < 0 else "sin cambio")
+            marca = "  ← CRÍTICA" if es_critica else ""
+            tag = ("critica",) if es_critica else ()
+            tree.insert("", "end", tags=tag, values=(
+                i + 1,
+                etiquetas[i],
+                f"{sumas_b8[i]:.4f}",
+                f"{sumas_w8[i]:.4f}",
+                f"{deltas_abs[i]:.4f}",
+                f"{d:.4f}",
+                f"{direccion}{marca}"
+            ))
+
+        vsb = ttk.Scrollbar(tabla_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+
+        # Conclusiones por variable crítica
+        concl_frame = tk.Frame(tab_tabla, bg=PALETA["fondo"], bd=1, relief="solid")
+        concl_frame.pack(fill="x", padx=10, pady=(5, 10))
+        lineas = []
+        for var in variables_criticas:
+            idx = etiquetas.index(var)
+            d = deltas_sign[idx]
+            if d < 0:
+                interp = f"se ALEJÓ del sistema en {NOMBRE_PEOR} (delta={d:.4f}) — mayor distancia NCD acumulada."
+            else:
+                interp = f"se ACERCÓ al sistema en {NOMBRE_PEOR} (delta={d:.4f}) — menor distancia NCD acumulada."
+            lineas.append(f"• [{idx+1}] {var}: {interp}")
+        min_i = deltas_sign.index(min(deltas_sign))
+        max_i = deltas_sign.index(max(deltas_sign))
+        lineas.append(f"\n[Global] Desvío máx. negativo → Fila {min_i+1} ({etiquetas[min_i]}): {deltas_sign[min_i]:.4f}")
+        lineas.append(f"[Global] Desvío máx. positivo → Fila {max_i+1} ({etiquetas[max_i]}): {deltas_sign[max_i]:.4f}")
+        lbl_concl = tk.Label(concl_frame, text="\n".join(lineas),
+                             font=("Segoe UI", 9), fg=PALETA["acento"], bg=PALETA["fondo"], justify="left")
+        lbl_concl.pack(anchor="w", padx=12, pady=8)
+
+        # Pestaña 2: Visualización MST comparativa
+        tab_mst = ttk.Frame(notebook)
+        notebook.add(tab_mst, text=f"Comparativa MST ({NOMBRE_MEJOR} vs {NOMBRE_PEOR})")
+
+        fig = plt.Figure(figsize=(12, 6.5), facecolor=PALETA["fondo"])
         ax_b8 = fig.add_subplot(121)
         ax_w8 = fig.add_subplot(122)
 
-        hubs_b8 = [n for n, grado in datos_b8["mst_kruskal"].degree() if grado >= 3]
-        hubs_w8 = [n for n, grado in datos_w8["mst_kruskal"].degree() if grado >= 3]
+        # Hubs sólo para visualización del MST (no para criticidad)
+        hubs_b8 = [n for n, g in datos_b8["mst_kruskal"].degree() if g >= 3]
+        hubs_w8 = [n for n, g in datos_w8["mst_kruskal"].degree() if g >= 3]
+        dibujar_mst(datos_b8["mst_kruskal"], hubs_b8, ax_b8, es_peor=False, variables_criticas=variables_criticas)
+        dibujar_mst(datos_w8["mst_kruskal"], hubs_w8, ax_w8, es_peor=True,  variables_criticas=variables_criticas)
+        fig.suptitle(f"MST: {NOMBRE_MEJOR} (Mejores) vs {NOMBRE_PEOR} (Peores) — Variables críticas destacadas",
+                     color=PALETA["titulo"], fontsize=12, fontweight="bold", y=0.98)
+        fig.subplots_adjust(top=0.88)
 
-        dibujar_mst(datos_b8["mst_kruskal"], hubs_b8, ax_b8, es_peor=False)
-        dibujar_mst(datos_w8["mst_kruskal"], hubs_w8, ax_w8, es_peor=True)
+        # Embed figura en la pestaña
+        canvas_mst = FigureCanvasTkAgg(fig, master=tab_mst)
+        canvas_mst.draw()
+        canvas_mst.get_tk_widget().pack(fill="both", expand=True)
 
-        fig.suptitle("Comparativa de Topologias del MST (Pizarra)", 
-                     color=PALETA["titulo"], fontsize=13, fontweight="bold", y=0.98)
-        
-        fig.subplots_adjust(top=0.85)
-
-        self.mostrar_figura(fig)
-
-        # Imprimir en la consola para registrar la explicación
+        # Log en consola
         print("\n============================================================")
-        print("  PASO 8 - Variables Criticas Identificadas en la Pizarra")
+        print("  PASO 9 - Variables Criticas (Cambio de Patron de Relaciones NCD)")
         print("============================================================")
-        print("  B8C1 -> Estructura: Asistencia y Edad están en la periferia, separadas de la Nota Promedio.")
-        print("  W8C4 -> Estructura: Asistencia se convierte en el super-hub (grado 4) central del sistema de deserción.")
-        print("\n  * Variables críticas de la transición:")
-        print("    {X1 = Edad, X2 = Genero, X3 = Trabaja}")
-        print("\n  * Análisis de la transición:")
-        print("    - Las variables críticas mantienen sus conexiones directas locales (Trabaja con Género y Edad con Asistencia).")
-        print("    - El cambio clave radica en cómo se acoplan a la red general:")
-        print("      - En los mejores (B8C1), la Asistencia y Edad están en la periferia de la estructura, alejadas de la Nota Promedio.")
-        print("      - En los peores (W8C4), la Asistencia es el super-hub central (grado 4) de riesgo, conectando de forma directa")
-        print("        a la Edad (alumnos mayores) con la Nota Promedio (bajo rendimiento), actuando como el puente crítico escolar.")
+        print(f"  Umbral (media + 0.5*std): {umbral:.4f}")
+        print(f"  Variables criticas identificadas ({len(variables_criticas)}): {variables_criticas}")
+        for var in variables_criticas:
+            idx = etiquetas.index(var)
+            d = deltas_sign[idx]
+            verb = "ALEJO" if d < 0 else "ACERCO"
+            print(f"    [{idx+1}] {var}: se {verb} del sistema en {NOMBRE_PEOR} (delta={d:.4f})")
 
     def render_paso_10(self):
-        """Paso 10: Validación Matemática (Suma NCD)."""
-        lbl = tk.Label(self.display_frame, text="PASO 10: Validación Matemática de Transición por Matriz NCD", 
+        """Paso 10: Dashboard Completo."""
+        lbl = tk.Label(self.display_frame, text=f"PASO 10: Dashboard Completo ({self.grupo_seleccionado.get()})",
                        font=("Segoe UI", 14, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
-        lbl.pack(anchor="w", pady=(0, 10))
+        lbl.pack(anchor="w", pady=(0, 5))
 
-        # Asegurar de calcular ambos grupos
-        if not self.resultados["W8C4"]:
-            self.grupo_seleccionado.set("W8C4")
-            self.ejecutar_calculos_grupo()
-            self.grupo_seleccionado.set("B8C1")  # restaurar
+        datos = self.obtener_datos_grupo_actual()
 
-        datos_b8 = self.resultados["B8C1"]
-        datos_w8 = self.resultados["W8C4"]
+        ruta_salida_dash = f"{RUTA_RESULTADOS}/dashboard_{self.grupo_seleccionado.get()}.png"
+        es_peor = (self.grupo_seleccionado.get() == NOMBRE_PEOR)
 
-        # Crear un Notebook para las pestañas
-        notebook = ttk.Notebook(self.display_frame)
-        notebook.pack(fill="both", expand=True)
-
-        # Estilo para el notebook
-        self.estilo.configure("TNotebook", background=PALETA["fondo"])
-        self.estilo.configure("TNotebook.Tab", background=PALETA["superficie"], foreground=PALETA["etiqueta"],
-                               font=("Segoe UI", 10, "bold"), padding=[10, 4])
-        self.estilo.map("TNotebook.Tab", background=[("selected", PALETA["borde"])], foreground=[("selected", PALETA["acento"])])
-
-        # Pestaña 1: Matriz B8C1
-        tab_b8 = ttk.Frame(notebook)
-        notebook.add(tab_b8, text="Matriz NCD - B8C1 (Mejores)")
-        self.crear_grid_matriz(tab_b8, datos_b8)
-
-        # Pestaña 2: Matriz W8C4
-        tab_w8 = ttk.Frame(notebook)
-        notebook.add(tab_w8, text="Matriz NCD - W8C4 (Peores)")
-        self.crear_grid_matriz(tab_w8, datos_w8)
-
-        # Pestaña 3: Suma y Resta (Pizarra)
-        tab_analisis = ttk.Frame(notebook)
-        notebook.add(tab_analisis, text="Análisis de Sumas y Resta (Pizarra)")
-        self.crear_analisis_pizarra(tab_analisis, datos_b8, datos_w8)
-
-    def crear_grid_matriz(self, parent, datos):
-        frame = tk.Frame(parent, bg=PALETA["superficie"])
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        columnas = ["Variable"] + datos["etiquetas"]
-        tree = ttk.Treeview(frame, columns=columnas, show="headings")
-        
-        # Scrollbars
-        vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
-        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        
-        vsb.pack(side="right", fill="y")
-        hsb.pack(side="bottom", fill="x")
-        tree.pack(fill="both", expand=True)
-        
-        # Configurar columnas
-        tree.heading("Variable", text="Variable")
-        tree.column("Variable", width=120, anchor="w")
-        for et in datos["etiquetas"]:
-            tree.heading(et, text=et)
-            tree.column(et, width=80, anchor="center")
-            
-        # Insertar filas
-        for i, et_fila in enumerate(datos["etiquetas"]):
-            valores = [et_fila]
-            for j in range(11):
-                val = datos["matriz_norm"][i, j]
-                valores.append(f"{val:.3f}")
-            tree.insert("", "end", values=valores)
-
-    def crear_analisis_pizarra(self, parent, datos_b8, datos_w8):
-        frame = tk.Frame(parent, bg=PALETA["superficie"], bd=1, relief="solid")
-        frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Explicación del proceso
-        lbl_explicacion = tk.Label(
-            frame, 
-            text="PROCESO MATEMÁTICO (DE ACUERDO A LA PIZARRA):\n"
-                 "1. Para cada grupo, sumamos horizontalmente solo los valores que están ENCIMA DE LA DIAGONAL (j > i).\n"
-                 "2. Restamos la suma de B8C1 (Mejores) menos la suma de W8C4 (Peores) para cada fila: Diff = Sum_B8C1 - Sum_W8C4.\n"
-                 "3. El MÍNIMO de las diferencias identifica la variable de mayor desvío negativo (mayor distanciamiento/aislamiento en peores).\n"
-                 "4. El MÁXIMO de las diferencias identifica la variable de mayor desvío positivo (mayor conexión en peores).",
-            font=("Segoe UI", 10, "bold"), fg=PALETA["acento"], bg=PALETA["superficie"], justify="left"
+        fig = crear_dashboard(
+            datos["grafo"], datos["mst_kruskal"],
+            ruta_salida=ruta_salida_dash, es_peor=es_peor, mostrar=False
         )
-        lbl_explicacion.pack(anchor="w", padx=15, pady=(15, 10))
-
-        # Tabla de resultados
-        tree_frame = tk.Frame(frame, bg=PALETA["superficie"])
-        tree_frame.pack(fill="both", expand=True, padx=15, pady=5)
-        
-        tree = ttk.Treeview(tree_frame, columns=("Fila", "Variable", "B8C1", "W8C4", "Diferencia"), 
-                            show="headings", height=11)
-        tree.heading("Fila", text="Fila")
-        tree.heading("Variable", text="Variable (X_i)")
-        tree.heading("B8C1", text="Suma B8C1 (Mejores)")
-        tree.heading("W8C4", text="Suma W8C4 (Peores)")
-        tree.heading("Diferencia", text="Resta (B8C1 - W8C4)")
-        
-        tree.column("Fila", width=50, anchor="center")
-        tree.column("Variable", width=180, anchor="w")
-        tree.column("B8C1", width=150, anchor="center")
-        tree.column("W8C4", width=150, anchor="center")
-        tree.column("Diferencia", width=180, anchor="center")
-        
-        # Calcular sumas por encima de la diagonal
-        etiquetas = datos_b8["etiquetas"]
-        sumas_b8 = []
-        sumas_w8 = []
-        for i in range(11):
-            sum_b8 = sum(datos_b8["matriz_norm"][i, j] for j in range(i+1, 11))
-            sum_w8 = sum(datos_w8["matriz_norm"][i, j] for j in range(i+1, 11))
-            sumas_b8.append(sum_b8)
-            sumas_w8.append(sum_w8)
-
-        diferencias = [sumas_b8[i] - sumas_w8[i] for i in range(11)]
-        min_idx = diferencias.index(min(diferencias))
-        max_idx = diferencias.index(max(diferencias))
-        
-        for i in range(11):
-            tag = ""
-            if i == min_idx: tag = " [MÍNIMO]"
-            elif i == max_idx: tag = " [MÁXIMO]"
-            
-            tree.insert("", "end", values=(
-                f"{i+1}",
-                f"{etiquetas[i]}",
-                f"{sumas_b8[i]:.4f}",
-                f"{sumas_w8[i]:.4f}",
-                f"{diferencias[i]:.4f}{tag}"
-            ))
-            
-        tree.pack(fill="both", expand=True)
-        
-        # Conclusiones Card
-        concl_frame = tk.Frame(frame, bg=PALETA["fondo"], bd=1, relief="solid")
-        concl_frame.pack(fill="x", padx=15, pady=15)
-        
-        concl_texto = (
-            f"CONCLUSIONES MATEMÁTICAS:\n"
-            f"• MÍNIMA DIFERENCIA: Fila {min_idx+1} - {etiquetas[min_idx]} ({diferencias[min_idx]:.4f})\n"
-            f"  -> Representa el mayor desvío negativo: la variable incrementó notablemente su distancia NCD (se desconectó/aisló) en peores alumnos.\n"
-            f"• MÁXIMA DIFERENCIA: Fila {max_idx+1} - {etiquetas[max_idx]} ({diferencias[max_idx]:.4f})\n"
-            f"  -> Representa el mayor desvío positivo: la variable redujo su distancia NCD (se acopló más fuertemente) en peores alumnos."
-        )
-        lbl_concl = tk.Label(concl_frame, text=concl_texto, font=("Segoe UI", 9, "bold"), 
-                             fg=PALETA["acento"], bg=PALETA["fondo"], justify="left")
-        lbl_concl.pack(padx=15, pady=10, anchor="w")
+        self.mostrar_figura(fig)
 
     def render_paso_11(self):
-        """Paso 11: Dashboard Completo."""
-        lbl = tk.Label(self.display_frame, text=f"PASO 11: Dashboard Completo ({self.grupo_seleccionado.get()})", 
+        """Paso 11: Red Bayesiana (DAG Dirigido & CPD Inferencia)."""
+        lbl = tk.Label(self.display_frame, text=f"PASO 11: Red Bayesiana (DAG & CPD) — {self.grupo_seleccionado.get()}",
                        font=("Segoe UI", 14, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
         lbl.pack(anchor="w", pady=(0, 5))
 
         datos = self.obtener_datos_grupo_actual()
         
-        # Generar dashboard interactivo sin plt.show
-        ruta_salida_dash = f"{RUTA_RESULTADOS}/dashboard_{self.grupo_seleccionado.get()}.png"
-        es_peor = (self.grupo_seleccionado.get() == "W8C4")
+        # Obtener o calcular DAG y CPDs
+        if "dag" not in datos or datos["dag"] is None:
+            matriz = datos["matriz"]
+            etiquetas = datos["etiquetas"]
+            df_grupo = datos["df_grupo"]
+            dag = construir_dag_bayesiano(matriz, etiquetas, df_grupo)
+            cpds = calcular_cpds(dag, df_grupo)
+            datos["dag"] = dag
+            datos["cpds"] = cpds
+        else:
+            dag = datos["dag"]
+            cpds = datos["cpds"]
+
+        notebook = ttk.Notebook(self.display_frame)
+        notebook.pack(fill="both", expand=True)
+
+        # Tab 1: DAG Visual
+        tab_dag = ttk.Frame(notebook)
+        notebook.add(tab_dag, text="Grafo Dirigido (DAG)")
+
+        fig_dag = plt.Figure(figsize=(10, 6), facecolor=PALETA["fondo"])
+        ax_dag = fig_dag.add_subplot(111)
+        dibujar_dag_bayesiano(dag, ax_dag, f"Red Bayesiana (DAG Dirigido) - Grupo {self.grupo_seleccionado.get()}")
+        fig_dag.tight_layout()
+
+        canvas_dag = FigureCanvasTkAgg(fig_dag, master=tab_dag)
+        canvas_dag.draw()
+        canvas_dag.get_tk_widget().pack(fill="both", expand=True)
+
+        # Tab 2: Consulta de Inferencia
+        tab_inf = ttk.Frame(notebook)
+        notebook.add(tab_inf, text="Simulación de Inferencia Probabilística")
+
+        lbl_inf = tk.Label(tab_inf, text="Consulta de Inferencia P(Variable Objetivo | Evidencia)",
+                           font=("Segoe UI", 11, "bold"), fg=PALETA["acento"], bg=PALETA["fondo"])
+        lbl_inf.pack(anchor="w", padx=15, pady=10)
+
+        # Frame selector
+        ctrl_frame = tk.Frame(tab_inf, bg=PALETA["superficie"], bd=1, relief="solid")
+        ctrl_frame.pack(fill="x", padx=15, pady=5)
+
+        tk.Label(ctrl_frame, text="Variable Objetivo:", font=("Segoe UI", 9, "bold"),
+                 fg=PALETA["etiqueta"], bg=PALETA["superficie"]).grid(row=0, column=0, padx=10, pady=10, sticky="w")
         
-        fig = crear_dashboard(
-            datos["grafo"], datos["mst_kruskal"], 
-            ruta_salida=ruta_salida_dash, es_peor=es_peor, mostrar=False
-        )
-        self.mostrar_figura(fig)
+        var_obj_combo = ttk.Combobox(ctrl_frame, values=list(dag.nodes()), state="readonly", width=25)
+        var_obj_combo.set(list(dag.nodes())[0])
+        var_obj_combo.grid(row=0, column=1, padx=10, pady=10)
+
+        res_box = ScrolledText(tab_inf, bg="#0A0C10", fg="#5FFB68", font=("Consolas", 10), height=15)
+        res_box.pack(fill="both", expand=True, padx=15, pady=15)
+
+        def ejecutar_consulta():
+            target = var_obj_combo.get()
+            
+            # Obtener el DataFrame de CPD real (Tabla de Probabilidad Condicional)
+            # que toma en cuenta los estados de los nodos padres, tal como en la pizarra.
+            cpd_df = cpds.get(target)
+            padres = list(dag.predecessors(target))
+            
+            res_box.delete("1.0", tk.END)
+            res_box.insert(tk.END, f"=== TABLA DE PROBABILIDAD CONDICIONAL BAYESIANA (CPD) ===\n")
+            res_box.insert(tk.END, f"Variable Analizada: {target} | Grupo: {self.grupo_seleccionado.get()}\n")
+            
+            if padres:
+                res_box.insert(tk.END, f"Nodos Padres (Causas): {', '.join(padres)}\n\n")
+                res_box.insert(tk.END, "Probabilidad de los posibles valores condicionada a las variables padre:\n")
+                res_box.insert(tk.END, "-" * 75 + "\n")
+                # Mostrar el DataFrame directamente, alineado a la izquierda
+                res_box.insert(tk.END, cpd_df.to_string(index=False, justify='left') + "\n")
+                res_box.insert(tk.END, "-" * 75 + "\n")
+            else:
+                res_box.insert(tk.END, f"Nodo Raíz (Sin padres, probabilidad simple/marginal)\n\n")
+                res_box.insert(tk.END, "Probabilidad de los posibles valores:\n")
+                res_box.insert(tk.END, "-" * 50 + "\n")
+                for index, row in cpd_df.iterrows():
+                    res_box.insert(tk.END, f"  Estado '{row['Estado']:<25}': {row['Probabilidad']*100:6.2f}%\n")
+                res_box.insert(tk.END, "-" * 50 + "\n")
+
+        btn_calc = tk.Button(ctrl_frame, text="Calcular Inferencia", command=ejecutar_consulta,
+                             bg=PALETA["nodo_grafo"], fg="white", font=("Segoe UI", 9, "bold"), relief="flat")
+        btn_calc.grid(row=0, column=2, padx=15, pady=10)
+        
+        ejecutar_consulta()
+
 
 
 def main():

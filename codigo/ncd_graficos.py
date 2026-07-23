@@ -15,6 +15,7 @@ Uso:
 """
 
 import os
+from typing import Any
 import numpy as np
 import networkx as nx
 import matplotlib
@@ -39,11 +40,10 @@ PALETA = {
     "acento":        "#FFE66D",
     "titulo":        "#E0E0E0",
     "subtitulo":     "#9E9E9E",
-    "variable_critica": "#F39C12",  # Naranja para X2 (Género) y X3 (Trabaja)
+    "variable_critica": "#F39C12",  # Naranja para X7 (Discapacidad), X3 (Educación) y X9 (Intentos)
 }
 
-# Variables críticas de la transición: {X1, X2, X3}
-VARIABLES_CRITICAS = ["Genero", "Trabaja", "Edad"]
+VARIABLES_CRITICAS = ["Num Prev Attempts"]
 
 # ── Utilidades internas ────────────────────────────────────────────────────────
 
@@ -98,17 +98,20 @@ def obtener_posiciones_arbol(grafo: nx.Graph, root=None, width=32.0, height=22.0
 
 
 
-def _colores_nodos(nodos: list, hubs: list, es_grafo_completo: bool = False) -> list:
+def _colores_nodos(nodos: list, hubs: list, es_grafo_completo: bool = False, variables_criticas: list = None) -> list:
     """
     Asigna un color a cada nodo:
-    - Naranja (#F39C12) → variable crítica (Género o Trabaja)
+    - Naranja (#F39C12) → variable crítica
     - Rojo (#FF6B6B)    → hub (grado >= 3) en MST
     - Azul/Blanco       → nodo normal
     """
+    if variables_criticas is None:
+        variables_criticas = VARIABLES_CRITICAS
+
     colores = []
     for nodo in nodos:
         nodo_limpio = nodo.replace("\n", " ").strip()
-        if any(critica in nodo_limpio for critica in VARIABLES_CRITICAS):
+        if any(critica in nodo_limpio for critica in variables_criticas):
             colores.append(PALETA["variable_critica"])
         elif nodo in hubs:
             colores.append(PALETA["nodo_hub"])
@@ -167,7 +170,7 @@ def dibujar_heatmap(matriz: np.ndarray, etiquetas: list[str], ruta_salida: str =
 
 # ── Grafo completo ─────────────────────────────────────────────────────────────
 
-def dibujar_grafo_completo(grafo: nx.Graph, hubs: list, ax: plt.Axes) -> None:
+def dibujar_grafo_completo(grafo: nx.Graph, hubs: list, ax: plt.Axes, variables_criticas: list = None) -> None:
     """
     Dibuja el grafo completo K₁₁ en el eje dado.
 
@@ -179,7 +182,7 @@ def dibujar_grafo_completo(grafo: nx.Graph, hubs: list, ax: plt.Axes) -> None:
     posiciones = {nodo: (coords[0] * 1.5, coords[1] * 1.5) for nodo, coords in posiciones.items()}
 
     nodos = list(grafo.nodes())
-    colores = _colores_nodos(nodos, hubs, es_grafo_completo=True)
+    colores = _colores_nodos(nodos, hubs, es_grafo_completo=True, variables_criticas=variables_criticas)
     # Aumentar tamaño de nodos para que el texto encaje perfectamente
     tamaños = [2200 if n in hubs else 1800 for n in nodos]
     grosores = [d["weight"] * 1.2 for _, _, d in grafo.edges(data=True)]
@@ -209,7 +212,7 @@ def dibujar_grafo_completo(grafo: nx.Graph, hubs: list, ax: plt.Axes) -> None:
 
 # ── Árbol de Expansión Mínima (MST) ───────────────────────────────────────────
 
-def dibujar_mst(grafo_mst: nx.Graph, hubs: list, ax: plt.Axes, es_peor: bool = False) -> None:
+def dibujar_mst(grafo_mst: nx.Graph, hubs: list, ax: plt.Axes, es_peor: bool = False, variables_criticas: list = None) -> None:
     """
     Dibuja el MST con una distribución jerárquica (de arriba hacia abajo) como un árbol real.
     """
@@ -217,11 +220,11 @@ def dibujar_mst(grafo_mst: nx.Graph, hubs: list, ax: plt.Axes, es_peor: bool = F
     posiciones = obtener_posiciones_arbol(grafo_mst, width=54.0, height=36.0)
 
     nodos = list(grafo_mst.nodes())
-    colores = _colores_nodos(nodos, hubs)
+    colores = _colores_nodos(nodos, hubs, variables_criticas=variables_criticas)
     # Nodos reducidos significativamente para que las aristas se vean
     tamaños = [1000 if n in hubs else 600 for n in nodos]
     grosores = [d["weight"] * 5 for _, _, d in grafo_mst.edges(data=True)]
-    etiquetas_aristas = {(a, b): f"{d['weight']:.2f}" for a, b, d in grafo_mst.edges(data=True)}
+    etiquetas_aristas = {(a, b): f"{d['weight']:.4f}" for a, b, d in grafo_mst.edges(data=True)}
 
     nx.draw_networkx_edges(grafo_mst, posiciones, ax=ax,
                            width=grosores, edge_color=PALETA["arista_mst"], alpha=0.85)
@@ -264,7 +267,9 @@ def dibujar_mst(grafo_mst: nx.Graph, hubs: list, ax: plt.Axes, es_peor: bool = F
                 color=PALETA["subtitulo"], fontsize=8)
 
     parche_hub  = mpatches.Patch(color=PALETA["nodo_hub"],   label="Hub (grado ≥ 3)")
-    parche_crit = mpatches.Patch(color=PALETA["variable_critica"], label="Variable crítica {X₂, X₃}")
+    crit_vars_list = variables_criticas if variables_criticas is not None else VARIABLES_CRITICAS
+    crit_str = f" ({', '.join(crit_vars_list)})" if crit_vars_list else ""
+    parche_crit = mpatches.Patch(color=PALETA["variable_critica"], label=f"Variable crítica{crit_str}")
     parche_nodo = mpatches.Patch(color=PALETA["nodo_mst"],   label="Variable")
     # Colocar la leyenda en la esquina superior izquierda libre de nodos con opacidad mejorada
     ax.legend(handles=[parche_nodo, parche_hub, parche_crit], loc="upper left",
@@ -350,3 +355,136 @@ def crear_dashboard(grafo: nx.Graph, grafo_mst: nx.Graph,
         plt.show(block=False)
         
     return fig
+
+
+# ── Grafo Acíclico Dirigido (DAG Bayesiano) ───────────────────────────────────
+
+def _obtener_nivel_causal(nombre: str) -> int:
+    """Asigna un nivel jerárquico causal a cada variable para el layout del DAG."""
+    nombre_lower = nombre.lower()
+    if any(k in nombre_lower for k in ["gender", "region", "disability"]):
+        return 0  # Demográfico / Entorno
+    elif any(k in nombre_lower for k in ["age", "education", "imd"]):
+        return 1  # Historial / Contexto
+    elif any(k in nombre_lower for k in ["credits", "attempts", "module"]):
+        return 2  # Esfuerzo / Módulo Actual
+    else:
+        return 3  # Resultado / Rendimiento
+
+
+def dibujar_dag_bayesiano(dag: nx.DiGraph, ax: plt.Axes, titulo: str = "Red Bayesiana (DAG Dirigido)") -> None:
+    """
+    Dibuja el Grafo Acíclico Dirigido (DAG) Bayesiano con flechas claramente visibles.
+    Usa un layout de fuerza (spring_layout) sobre un layout jerárquico para 
+    distribuir mejor los nodos en el espacio y evitar superposiciones.
+    """
+    # ── Layout Jerárquico Explícito ──
+    # Agrupar nodos por su nivel causal
+    niveles = {}
+    for nodo in dag.nodes():
+        lvl = _obtener_nivel_causal(nodo)
+        if lvl not in niveles:
+            niveles[lvl] = []
+        niveles[lvl].append(nodo)
+
+    posiciones = {}
+    # Asignar coordenadas exactas para garantizar distribución perfecta
+    for lvl, nodos_nivel in niveles.items():
+        n = len(nodos_nivel)
+        for i, nodo in enumerate(nodos_nivel):
+            # Centrar los nodos de cada nivel horizontalmente
+            x = (i - (n - 1) / 2.0) * 4.0  # Espaciado horizontal amplio
+            y = -lvl * 3.0                 # Espaciado vertical amplio
+            posiciones[nodo] = (x, y)
+
+    # ── Colores de nodos por tipo ──
+    nodos = list(dag.nodes())
+    colores = []
+    for n in nodos:
+        nivel = _obtener_nivel_causal(n)
+        if nivel == 3:  # Resultado
+            colores.append(PALETA["variable_critica"])
+        elif nivel == 0:  # Raíz / Demográfico
+            colores.append("#2ECC71")
+        else:  # Intermedio
+            colores.append(PALETA["nodo_grafo"])
+
+    tamaño_nodo = 1200  # Aumentar tamaño para que quepa bien el texto
+
+    # ── Dibujar nodos ──
+    nx.draw_networkx_nodes(
+        dag, posiciones, ax=ax,
+        node_color=colores, node_size=tamaño_nodo,
+        alpha=0.95, edgecolors="#FFFFFF", linewidths=1.5
+    )
+
+    # ── Dibujar aristas dirigidas CON FLECHAS VISIBLES ──
+    nx.draw_networkx_edges(
+        dag, posiciones, ax=ax,
+        edge_color=PALETA["arista_mst"],
+        arrows=True,
+        arrowstyle="-|>",
+        arrowsize=25,
+        width=2.0,
+        min_source_margin=18,
+        min_target_margin=18,
+        connectionstyle="arc3,rad=0.08",
+        alpha=0.85
+    )
+
+    # ── Etiquetas de Nodos ──
+    labels = {n: n.replace(" ", "\n") for n in dag.nodes()}
+    nx.draw_networkx_labels(
+        dag, posiciones, ax=ax, labels=labels,
+        font_color=PALETA["etiqueta"], font_size=7, font_weight="bold"
+    )
+
+    # ── Etiquetas de Aristas (Probabilidades) ──
+    edge_labels = {}
+    for u, v, d in dag.edges(data=True):
+        if 'prob_conjunta' in d and d['prob_conjunta'] > 0:
+            edge_labels[(u, v)] = f"{d['prob_conjunta']:.2f}"
+            
+    if edge_labels:
+        nx.draw_networkx_edge_labels(
+            dag, posiciones, edge_labels=edge_labels, ax=ax,
+            font_size=8, font_color="#FFFFFF", font_weight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", fc="#2C3E50", ec="none", alpha=0.85),
+            label_pos=0.4 # Posición ligeramente antes de la punta de la flecha
+        )
+
+    ax.set_facecolor(PALETA["superficie"])
+    ax.set_title(titulo, color=PALETA["titulo"], fontsize=12, fontweight="bold", pad=12)
+    ax.axis("off")
+
+    # ── Leyenda ──
+    p_raiz  = mpatches.Patch(color="#2ECC71", label="Nivel 1: Demográfico / Entorno (Raíz)")
+    p_inter = mpatches.Patch(color=PALETA["nodo_grafo"], label="Nivel 2-3: Contexto / Esfuerzo")
+    p_res   = mpatches.Patch(color=PALETA["variable_critica"], label="Nivel 4: Resultado / Rendimiento")
+    ax.legend(
+        handles=[p_raiz, p_inter, p_res], loc="lower left",
+        facecolor=PALETA["superficie"], edgecolor=PALETA["borde"],
+        labelcolor=PALETA["etiqueta"], fontsize=7
+    )
+
+
+def crear_dashboard_bayesiano(dag: nx.DiGraph, df_transicion: Any, ruta_salida: str = None, mostrar: bool = False) -> plt.Figure:
+    """
+    Genera un dashboard de la Red Bayesiana con el DAG Dirigido y la tabla de transición.
+    """
+    fig = plt.figure(figsize=(16, 9), facecolor=PALETA["fondo"])
+    gs = GridSpec(1, 1, figure=fig)
+
+    ax_dag = fig.add_subplot(gs[0, 0])
+    dibujar_dag_bayesiano(dag, ax_dag, "Red Bayesiana Dirigida (DAG) - Relaciones de Causalidad e Inferencia")
+
+    if ruta_salida:
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
+        plt.savefig(ruta_salida, dpi=150, bbox_inches="tight", facecolor=PALETA["fondo"])
+        print(f"  [OK] Dashboard Bayesiano guardado en '{ruta_salida}'")
+
+    if mostrar:
+        plt.show(block=False)
+
+    return fig
+
